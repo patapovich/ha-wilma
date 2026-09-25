@@ -717,6 +717,21 @@ def _first_text(event: dict, key: str) -> str:
     return _as_text(value).strip()
 
 
+def _event_teachers(event: dict) -> str:
+    """"Heiniö Päivi (PHei), Tuominen Sanna (STU)" from Opet codes + OpeInfo names."""
+    codes = [c.strip() for c in re.sub(r"^O:\s*", "", _first_text(event, "Opet")).split(",") if c.strip()]
+    info = event.get("OpeInfo")
+    if isinstance(info, dict):
+        info = info.get("0")
+    names: dict[str, str] = {}
+    if isinstance(info, dict):
+        for item in info.values():
+            if isinstance(item, dict) and item.get("lyhenne"):
+                names[str(item["lyhenne"])] = str(item.get("nimi") or "").strip()
+    parts = [f"{names[c]} ({c})" if names.get(c) else c for c in codes]
+    return ", ".join(parts)
+
+
 def _minutes(value: Any) -> str:
     try:
         total = int(value)
@@ -763,7 +778,7 @@ def parse_schedule_events(html: str) -> list[Lesson]:
             base_name = re.sub(r"\s+lkaste:.*$", "", long_text[len(code):]).strip()
             qualifier = text[len(base_name):] if base_name and text.startswith(base_name) else ""
             subject = (code + qualifier).strip() or text
-        teacher = re.sub(r"^O:\s*", "", _first_text(event, "Opet")).strip()
+        teacher = _event_teachers(event)
         room = _first_text(event, "Huoneet")
         out.append(
             Lesson(
@@ -782,18 +797,23 @@ def parse_schedule_events(html: str) -> list[Lesson]:
 
 
 async def _extend_schedule(session: aiohttp.ClientSession, base_url: str, user_id: str, data: SchoolData) -> None:
-    """Fill the weeks beyond the overview's DateArray horizon from the schedule pages."""
-    covered: set[str] = set()
-    for lesson in data.schedule:
-        covered.update(item[:10] for item in lesson.dates)
-    if not covered:
+    """Replace the overview's weekly slots with the schedule pages for the coming weeks.
+
+    The overview JSON gives each weekly slot a DateArray that Wilma caps a couple
+    of weeks ahead, and it knows nothing about cancelled or moved lessons or the
+    staff actually on a lesson. The schedule page has the real reservations for
+    any week, so for every week fetched here (this week + SCHEDULE_WEEKS_AHEAD)
+    its lessons win: those weekdays are dropped from the overview slots' DateArray
+    and the page's dated lessons are added. A week whose page fails to load keeps
+    the overview slots.
+    """
+    if not data.schedule:
         return
     today = datetime.now(ZoneInfo(TIMEZONE)).date()
-    horizon = max(covered)
-    first_missing = max(parse_date(horizon) or today, today) + timedelta(days=1)
-    monday = first_missing - timedelta(days=first_missing.weekday())
-    last = today + timedelta(days=7 * SCHEDULE_WEEKS_AHEAD)
-    added = 0
+    monday = today - timedelta(days=today.weekday())
+    last = monday + timedelta(days=7 * SCHEDULE_WEEKS_AHEAD)
+    added: list[Lesson] = []
+    replaced: set[str] = set()
     while monday <= last:
         path = f"schedule?date={monday.strftime('%d.%m.%Y')}"
         try:
@@ -801,16 +821,21 @@ async def _extend_schedule(session: aiohttp.ClientSession, base_url: str, user_i
         except Exception as err:  # noqa: BLE001
             data.probes.append(f"{path} ERR {err}")
             break
-        if status != 200 or not isinstance(payload, str):
+        if status != 200 or not isinstance(payload, str) or _looks_like_login_page(payload.lower()):
             data.probes.append(f"{path} {status} {ctype.split(';')[0]}")
             break
-        lessons = [item for item in parse_schedule_events(payload) if item.date not in covered]
+        lessons = parse_schedule_events(payload)
         data.probes.append(f"{path} 200 lessons={len(lessons)}")
-        data.schedule.extend(lessons)
-        added += len(lessons)
+        added.extend(lessons)
+        replaced.update((monday + timedelta(days=offset)).isoformat() for offset in range(7))
         monday += timedelta(days=7)
-    if added:
-        data.schedule = _dedupe_lessons(data.schedule)
+    if not replaced:
+        return
+    for lesson in data.schedule:
+        if lesson.dates:
+            lesson.dates = [item for item in lesson.dates if item[:10] not in replaced]
+    data.schedule.extend(added)
+    data.schedule = _dedupe_lessons(data.schedule)
 
 
 async def load_school(session: aiohttp.ClientSession, base_url: str, user_id: str) -> SchoolData:
